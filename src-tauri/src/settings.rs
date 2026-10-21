@@ -1,5 +1,5 @@
 use crate::utils;
-use log::{debug, warn};
+use log::{debug, error, warn};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use specta::Type;
@@ -1094,18 +1094,18 @@ pub fn get_settings(app: &AppHandle) -> AppSettings {
         }
 
         if updated {
-            store.set("settings", serde_json::to_value(&settings).unwrap());
+            store_settings(&store, &settings);
         }
 
         settings
     } else {
         let default_settings = get_default_settings();
-        store.set("settings", serde_json::to_value(&default_settings).unwrap());
+        store_settings(&store, &default_settings);
         default_settings
     };
 
     if ensure_post_process_defaults(&mut settings) {
-        store.set("settings", serde_json::to_value(&settings).unwrap());
+        store_settings(&store, &settings);
     }
 
     settings
@@ -1274,12 +1274,21 @@ pub fn update_checks_effectively_enabled(settings: &AppSettings) -> bool {
     settings.update_checks_enabled && !update_checks_forced_disabled()
 }
 
+/// Write `settings` to the store, logging instead of panicking if they cannot
+/// be serialized (the in-memory copy stays authoritative for this run).
+fn store_settings<R: tauri::Runtime>(store: &tauri_plugin_store::Store<R>, settings: &AppSettings) {
+    match serde_json::to_value(settings) {
+        Ok(value) => store.set("settings", value),
+        Err(e) => error!("Failed to serialize settings: {}", e),
+    }
+}
+
 pub fn write_settings(app: &AppHandle, settings: AppSettings) {
     let store = app
         .store(crate::portable::store_path(SETTINGS_STORE_PATH))
         .expect("Failed to initialize store");
 
-    store.set("settings", serde_json::to_value(&settings).unwrap());
+    store_settings(&store, &settings);
 }
 
 pub fn get_bindings(app: &AppHandle) -> HashMap<String, ShortcutBinding> {

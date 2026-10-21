@@ -61,6 +61,9 @@ mod macos {
     /// the service is already in the requested state (unregistering a
     /// never-registered service returns an error on every launch otherwise).
     pub fn set_login_item(enabled: bool) {
+        // SAFETY: the SMAppService calls below are marked unsafe only because the
+        // generated objc2 bindings cannot prove the Objective-C contract. They take
+        // no pointers from us and operate on this app's own login item.
         let service = unsafe { SMAppService::mainAppService() };
         let status = unsafe { service.status() };
 

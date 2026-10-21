@@ -9,6 +9,7 @@ use crate::audio_toolkit::{
 use crate::helpers::clamshell;
 use crate::managers::transcription::StreamRouter;
 use crate::settings::{get_settings, write_settings, AppSettings, VadBackend};
+use crate::sync_ext::LockExt;
 use crate::utils;
 use handy_recorder::{Channels, EndReason, ErrorKind, Recorder, RecorderConfig, StartError};
 use log::{debug, error, info, trace, warn};
@@ -561,7 +562,7 @@ impl AudioRecordingManager {
     }
 
     pub fn invalidate_device_cache(&self) {
-        *self.cached_device.lock().unwrap() = None;
+        *self.cached_device.lock_or_recover() = None;
     }
 
     fn resolve_microphone_device(&self, settings: &AppSettings) -> MicrophoneResolution {
@@ -581,7 +582,7 @@ impl AudioRecordingManager {
 
         // Cache hit: skip the enumeration. A stale ID (device unplugged)
         // fails at open, where the caller invalidates and retries fresh.
-        if let Some((cached_name, id)) = self.cached_device.lock().unwrap().as_ref() {
+        if let Some((cached_name, id)) = self.cached_device.lock_or_recover().as_ref() {
             if *cached_name == device_name {
                 debug!("device resolve: cache hit for '{}'", device_name);
                 return MicrophoneResolution {
@@ -615,7 +616,7 @@ impl AudioRecordingManager {
             device.is_some()
         );
         if let Some(id) = &device {
-            *self.cached_device.lock().unwrap() = Some((device_name, id.clone()));
+            *self.cached_device.lock_or_recover() = Some((device_name, id.clone()));
         }
 
         let unavailable_selected_microphone = if enumeration_succeeded && device.is_none() {
@@ -659,7 +660,7 @@ impl AudioRecordingManager {
             // Hold state lock across the check AND close to serialize against
             // try_start_recording, preventing a race where the stream is closed
             // under an active recording.
-            let state = rm.state.lock().unwrap();
+            let state = rm.state.lock_or_recover();
             if rm.close_generation.load(Ordering::SeqCst) == gen
                 && matches!(*state, RecordingState::Idle)
             {
@@ -677,7 +678,7 @@ impl AudioRecordingManager {
     /* ---------- VAD --------------------------------------------------------- */
 
     pub fn preload_vad(&self) -> Result<(), anyhow::Error> {
-        let mut vad = self.vad.lock().unwrap();
+        let mut vad = self.vad.lock_or_recover();
         if matches!(*vad, VadSlot::Unloaded) {
             let settings = get_settings(&self.app_handle);
             *vad = VadSlot::Idle(create_capture_vad(settings.vad_backend, &self.app_handle)?);
@@ -688,7 +689,7 @@ impl AudioRecordingManager {
     /// Samples per VAD frame: the chunk size the microphone is opened with.
     fn vad_frame_samples(&self) -> Result<usize, anyhow::Error> {
         self.preload_vad()?;
-        match &*self.vad.lock().unwrap() {
+        match &*self.vad.lock_or_recover() {
             VadSlot::Idle(vad) => Ok(vad.frame_samples()),
             VadSlot::Lent { frame_samples } => Ok(*frame_samples),
             VadSlot::Unloaded => unreachable!("preload_vad just loaded it"),
@@ -699,7 +700,7 @@ impl AudioRecordingManager {
     /// Lends the detector to a new recording. Called only while idle.
     fn lend_vad(&self) -> Result<CaptureVad, anyhow::Error> {
         {
-            let mut slot = self.vad.lock().unwrap();
+            let mut slot = self.vad.lock_or_recover();
             // No recording is active, so a lent detector went with a lost sink.
             if matches!(*slot, VadSlot::Lent { .. }) {
                 warn!("The last recording did not return its VAD detector; reloading it");
@@ -707,7 +708,7 @@ impl AudioRecordingManager {
             }
         }
         self.preload_vad()?;
-        let mut slot = self.vad.lock().unwrap();
+        let mut slot = self.vad.lock_or_recover();
         match std::mem::replace(&mut *slot, VadSlot::Unloaded) {
             VadSlot::Idle(vad) => {
                 *slot = VadSlot::Lent {
@@ -723,7 +724,7 @@ impl AudioRecordingManager {
     }
 
     fn return_vad(&self, vad: CaptureVad) {
-        *self.vad.lock().unwrap() = VadSlot::Idle(vad);
+        *self.vad.lock_or_recover() = VadSlot::Idle(vad);
     }
 
     /* ---------- microphone life-cycle -------------------------------------- */
@@ -738,8 +739,8 @@ impl AudioRecordingManager {
         }
 
         // Lock order: is_open before mute_state (matches stop_microphone_stream).
-        let is_open = self.is_open.lock().unwrap();
-        let mut mute_guard = self.mute_state.lock().unwrap();
+        let is_open = self.is_open.lock_or_recover();
+        let mut mute_guard = self.mute_state.lock_or_recover();
         // Already muted this session — don't re-snapshot, or a duplicate/late
         // apply would overwrite prev_muted with our own forced-muted state and
         // strand audio muted on stop.
@@ -757,7 +758,7 @@ impl AudioRecordingManager {
     /// Removes mute if it was applied, restoring the system's prior mute state
     /// (a system already muted before recording stays muted).
     pub fn remove_mute(&self) {
-        let mut mute_guard = self.mute_state.lock().unwrap();
+        let mut mute_guard = self.mute_state.lock_or_recover();
         if mute_guard.did_mute {
             restore_mute(mute_guard.prev_muted);
             mute_guard.did_mute = false;
@@ -769,7 +770,7 @@ impl AudioRecordingManager {
     }
 
     pub fn start_microphone_stream(&self) -> Result<(), anyhow::Error> {
-        let mut open_flag = self.is_open.lock().unwrap();
+        let mut open_flag = self.is_open.lock_or_recover();
         if *open_flag {
             // `is_open` only records that we opened a stream, not that it is
             // still running. If the recorder has since failed (mic unplugged,
@@ -777,8 +778,7 @@ impl AudioRecordingManager {
             // recording instead of handing the caller a failed recorder.
             let needs_reopen = self
                 .recorder
-                .lock()
-                .unwrap()
+                .lock_or_recover()
                 .as_ref()
                 .is_none_or(OpenMicrophone::needs_reopen);
 
@@ -795,13 +795,13 @@ impl AudioRecordingManager {
             // Torn down inline rather than via stop_microphone_stream(), which
             // takes the `is_open` lock we are already holding.
             {
-                let mut mute_guard = self.mute_state.lock().unwrap();
+                let mut mute_guard = self.mute_state.lock_or_recover();
                 if mute_guard.did_mute {
                     restore_mute(mute_guard.prev_muted);
                     mute_guard.did_mute = false;
                 }
             }
-            let failed = self.recorder.lock().unwrap().take();
+            let failed = self.recorder.lock_or_recover().take();
             if let Some(microphone) = failed {
                 self.close_microphone(microphone);
             }
@@ -818,7 +818,7 @@ impl AudioRecordingManager {
         // be false here; if it somehow isn't, restore rather than just clearing the
         // flag, which would strand system audio muted.
         {
-            let mut mute_guard = self.mute_state.lock().unwrap();
+            let mut mute_guard = self.mute_state.lock_or_recover();
             if mute_guard.did_mute {
                 restore_mute(mute_guard.prev_muted);
                 mute_guard.did_mute = false;
@@ -840,7 +840,7 @@ impl AudioRecordingManager {
         let frames_per_chunk = self.vad_frame_samples()?;
         let vad_elapsed = vad_started.elapsed();
 
-        let channel = *self.selected_channel.lock().unwrap();
+        let channel = *self.selected_channel.lock_or_recover();
         let open_started = Instant::now();
         let microphone = match open_microphone_on_channel(
             resolution.device.clone(),
@@ -864,7 +864,7 @@ impl AudioRecordingManager {
             vad_elapsed,
             open_started.elapsed()
         );
-        *self.recorder.lock().unwrap() = Some(microphone);
+        *self.recorder.lock_or_recover() = Some(microphone);
 
         *open_flag = true;
         if let Some(unavailable_name) = resolution.unavailable_selected_microphone {
@@ -883,20 +883,20 @@ impl AudioRecordingManager {
     }
 
     pub fn stop_microphone_stream(&self) {
-        let mut open_flag = self.is_open.lock().unwrap();
+        let mut open_flag = self.is_open.lock_or_recover();
         if !*open_flag {
             return;
         }
 
         {
-            let mut mute_guard = self.mute_state.lock().unwrap();
+            let mut mute_guard = self.mute_state.lock_or_recover();
             if mute_guard.did_mute {
                 restore_mute(mute_guard.prev_muted);
             }
             mute_guard.did_mute = false;
         }
 
-        let microphone = self.recorder.lock().unwrap().take();
+        let microphone = self.recorder.lock_or_recover().take();
         if let Some(microphone) = microphone {
             self.close_microphone(microphone);
         }
@@ -908,7 +908,7 @@ impl AudioRecordingManager {
     /// Closes a microphone, first discarding any recording on it (its
     /// detector comes back).
     fn close_microphone(&self, microphone: OpenMicrophone) {
-        let mut is_recording = self.is_recording.lock().unwrap();
+        let mut is_recording = self.is_recording.lock_or_recover();
         if *is_recording {
             let _ = self.collect_recording(&microphone);
             *is_recording = false;
@@ -949,7 +949,7 @@ impl AudioRecordingManager {
                 if e.kind() != ErrorKind::NotRecording {
                     microphone.failed.store(true, Ordering::Release);
                 }
-                *self.vad.lock().unwrap() = VadSlot::Unloaded;
+                *self.vad.lock_or_recover() = VadSlot::Unloaded;
                 Vec::new()
             }
         }
@@ -958,11 +958,11 @@ impl AudioRecordingManager {
     /* ---------- mode switching --------------------------------------------- */
 
     pub fn update_mode(&self, new_mode: MicrophoneMode) -> Result<(), anyhow::Error> {
-        let cur_mode = self.mode.lock().unwrap().clone();
+        let cur_mode = self.mode.lock_or_recover().clone();
 
         match (cur_mode, &new_mode) {
             (MicrophoneMode::AlwaysOn, MicrophoneMode::OnDemand) => {
-                if matches!(*self.state.lock().unwrap(), RecordingState::Idle) {
+                if matches!(*self.state.lock_or_recover(), RecordingState::Idle) {
                     self.close_generation.fetch_add(1, Ordering::SeqCst);
                     self.stop_microphone_stream();
                 }
@@ -974,7 +974,7 @@ impl AudioRecordingManager {
             _ => {}
         }
 
-        *self.mode.lock().unwrap() = new_mode;
+        *self.mode.lock_or_recover() = new_mode;
         Ok(())
     }
 
@@ -1000,7 +1000,7 @@ impl AudioRecordingManager {
         binding_id: &str,
         vad_policy: VadPolicy,
     ) -> Result<RecordingReadiness, anyhow::Error> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock_or_recover();
         if !matches!(*state, RecordingState::Idle) {
             return Err(anyhow::anyhow!("Already recording"));
         }
@@ -1031,7 +1031,7 @@ impl AudioRecordingManager {
                 ready_tx,
             );
 
-            let recorder = self.recorder.lock().unwrap();
+            let recorder = self.recorder.lock_or_recover();
             let Some(microphone) = recorder.as_ref() else {
                 self.return_vad(sink.into_vad());
                 return Err(anyhow::anyhow!("Recorder not available"));
@@ -1039,7 +1039,7 @@ impl AudioRecordingManager {
             match microphone.recorder.start(sink) {
                 Ok(()) => {
                     let generation = self.capture_generation.fetch_add(1, Ordering::AcqRel) + 1;
-                    *self.is_recording.lock().unwrap() = true;
+                    *self.is_recording.lock_or_recover() = true;
                     self.set_state(
                         &mut state,
                         RecordingState::Recording {
@@ -1070,7 +1070,7 @@ impl AudioRecordingManager {
     /// detector's chunk size before reporting success. A failed reopen restores
     /// the previous detector so the persisted setting can remain unchanged.
     pub fn update_vad_backend(&self, backend: VadBackend) -> Result<(), anyhow::Error> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock_or_recover();
         if !matches!(*state, RecordingState::Idle) {
             return Err(anyhow::anyhow!(
                 "Cannot change the VAD backend while recording"
@@ -1078,7 +1078,7 @@ impl AudioRecordingManager {
         }
 
         let replacement = create_capture_vad(backend, &self.app_handle)?;
-        let was_open = *self.is_open.lock().unwrap();
+        let was_open = *self.is_open.lock_or_recover();
 
         // Invalidate any delayed close before swapping the detector.
         self.close_generation.fetch_add(1, Ordering::SeqCst);
@@ -1087,10 +1087,10 @@ impl AudioRecordingManager {
         }
 
         let previous =
-            std::mem::replace(&mut *self.vad.lock().unwrap(), VadSlot::Idle(replacement));
+            std::mem::replace(&mut *self.vad.lock_or_recover(), VadSlot::Idle(replacement));
         if was_open {
             if let Err(change_error) = self.start_microphone_stream() {
-                *self.vad.lock().unwrap() = previous;
+                *self.vad.lock_or_recover() = previous;
 
                 if let Err(rollback_error) = self.start_microphone_stream() {
                     error!(
@@ -1112,7 +1112,7 @@ impl AudioRecordingManager {
     pub fn update_selected_device(&self) -> Result<(), anyhow::Error> {
         // Device settings changed; re-enumerate the device and restart capture.
         self.invalidate_device_cache();
-        let was_open = *self.is_open.lock().unwrap();
+        let was_open = *self.is_open.lock_or_recover();
         if was_open {
             self.close_generation.fetch_add(1, Ordering::SeqCst);
             self.stop_microphone_stream();
@@ -1128,25 +1128,25 @@ impl AudioRecordingManager {
         // Serialize against recording start/stop. Restarting an active capture
         // would discard its samples and leave the manager's recording state out
         // of sync with the new recorder.
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock_or_recover();
         if !matches!(*state, RecordingState::Idle) {
             return Err(anyhow::anyhow!(
                 "Cannot change the input channel while recording"
             ));
         }
 
-        let was_open = *self.is_open.lock().unwrap();
+        let was_open = *self.is_open.lock_or_recover();
         if was_open {
             self.close_generation.fetch_add(1, Ordering::SeqCst);
             self.stop_microphone_stream();
         }
         let previous_channel = std::mem::replace(
-            &mut *self.selected_channel.lock().unwrap(),
+            &mut *self.selected_channel.lock_or_recover(),
             selected_channel,
         );
         if was_open {
             if let Err(error) = self.start_microphone_stream() {
-                *self.selected_channel.lock().unwrap() = previous_channel;
+                *self.selected_channel.lock_or_recover() = previous_channel;
                 return Err(error);
             }
         }
@@ -1174,7 +1174,7 @@ impl AudioRecordingManager {
 
     pub fn stop_recording(&self, binding_id: &str, cancel_generation: u64) -> Option<Vec<f32>> {
         self.invalidate_recording_readiness();
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock_or_recover();
 
         match *state {
             RecordingState::Recording {
@@ -1205,7 +1205,7 @@ impl AudioRecordingManager {
                     }
                 }
 
-                let samples = match self.recorder.lock().unwrap().as_ref() {
+                let samples = match self.recorder.lock_or_recover().as_ref() {
                     Some(microphone) => self.collect_recording(microphone),
                     None => {
                         error!("Recorder not available");
@@ -1213,11 +1213,11 @@ impl AudioRecordingManager {
                     }
                 };
 
-                *self.is_recording.lock().unwrap() = false;
-                self.set_state(&mut self.state.lock().unwrap(), RecordingState::Idle);
+                *self.is_recording.lock_or_recover() = false;
+                self.set_state(&mut self.state.lock_or_recover(), RecordingState::Idle);
 
                 // In on-demand mode, close the mic (lazily if the setting is enabled)
-                if matches!(*self.mode.lock().unwrap(), MicrophoneMode::OnDemand) {
+                if matches!(*self.mode.lock_or_recover(), MicrophoneMode::OnDemand) {
                     if get_settings(&self.app_handle).lazy_stream_close {
                         self.schedule_lazy_close();
                     } else {
@@ -1257,21 +1257,21 @@ impl AudioRecordingManager {
     pub fn cancel_recording(&self) {
         self.invalidate_recording_readiness();
         self.cancel_generation.fetch_add(1, Ordering::AcqRel);
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock_or_recover();
 
         match *state {
             RecordingState::Recording { .. } => {
                 self.set_state(&mut state, RecordingState::Idle);
                 drop(state);
 
-                if let Some(microphone) = self.recorder.lock().unwrap().as_ref() {
+                if let Some(microphone) = self.recorder.lock_or_recover().as_ref() {
                     let _ = self.collect_recording(microphone); // Discard the result
                 }
 
-                *self.is_recording.lock().unwrap() = false;
+                *self.is_recording.lock_or_recover() = false;
 
                 // In on-demand mode, close the mic (lazily if the setting is enabled)
-                if matches!(*self.mode.lock().unwrap(), MicrophoneMode::OnDemand) {
+                if matches!(*self.mode.lock_or_recover(), MicrophoneMode::OnDemand) {
                     if get_settings(&self.app_handle).lazy_stream_close {
                         self.schedule_lazy_close();
                     } else {

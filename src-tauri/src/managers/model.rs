@@ -2,6 +2,7 @@ use super::model_capabilities::{
     CapabilityProbe, CapabilityProber, Compatibility, GgufHeaderProber,
 };
 use crate::settings::{get_settings, write_settings};
+use crate::sync_ext::LockExt;
 use anyhow::Result;
 use hf_hub::api::tokio::{ApiBuilder, CancellationToken, Progress};
 use hf_hub::{Cache, Repo, RepoType};
@@ -540,7 +541,7 @@ impl HfDownloadProgress {
 
     /// Instant of the most recent sign of life from the transfer.
     fn last_activity(&self) -> Instant {
-        self.state.lock().unwrap().last_activity
+        self.state.lock_or_recover().last_activity
     }
 
     fn emit(&self, downloaded: u64, total: u64) {
@@ -564,7 +565,7 @@ impl HfDownloadProgress {
 impl Progress for HfDownloadProgress {
     async fn init(&mut self, size: usize, _filename: &str) {
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.lock_or_recover();
             st.total = size as u64;
             st.downloaded = 0;
             st.last_emit = Instant::now();
@@ -575,7 +576,7 @@ impl Progress for HfDownloadProgress {
 
     async fn update(&mut self, size: usize) {
         let (downloaded, total, emit) = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.lock_or_recover();
             st.downloaded = st.downloaded.saturating_add(size as u64);
             let now = Instant::now();
             st.last_activity = now;
@@ -594,7 +595,7 @@ impl Progress for HfDownloadProgress {
 
     async fn finish(&mut self) {
         let total = {
-            let st = self.state.lock().unwrap();
+            let st = self.state.lock_or_recover();
             st.total.max(st.downloaded)
         };
         self.emit(total, total);
@@ -629,12 +630,12 @@ impl<'a> Drop for DownloadCleanup<'a> {
             return;
         }
         {
-            let mut models = self.available_models.lock().unwrap();
+            let mut models = self.available_models.lock_or_recover();
             if let Some(model) = models.get_mut(self.model_id.as_str()) {
                 model.is_downloading = false;
             }
         }
-        self.cancel_flags.lock().unwrap().remove(&self.model_id);
+        self.cancel_flags.lock_or_recover().remove(&self.model_id);
     }
 }
 
@@ -969,7 +970,7 @@ impl ModelManager {
 
     pub fn get_available_models(&self) -> Vec<ModelInfo> {
         let mut list: Vec<ModelInfo> = {
-            let models = self.available_models.lock().unwrap();
+            let models = self.available_models.lock_or_recover();
             models.values().cloned().collect()
         };
         // Stable, reasonable order: catalog editorial rank first (lower = higher
@@ -1043,7 +1044,7 @@ impl ModelManager {
         // Snapshot the current registry and discover against the copy off-lock.
         // The discover_* helpers are purely additive (they skip ids already in
         // the map), so the snapshot ends up as {current} ∪ {newly-found}.
-        let mut snapshot = self.available_models.lock().unwrap().clone();
+        let mut snapshot = self.available_models.lock_or_recover().clone();
         if let Err(e) = Self::discover_custom_transcribe_models(&self.models_dir, &mut snapshot) {
             warn!("Rescan: failed to discover custom models: {}", e);
         }
@@ -1053,7 +1054,7 @@ impl ModelManager {
         // leaves every existing entry exactly as it was.
         let mut added = 0usize;
         {
-            let mut live = self.available_models.lock().unwrap();
+            let mut live = self.available_models.lock_or_recover();
             for (id, info) in snapshot {
                 if let std::collections::hash_map::Entry::Vacant(entry) = live.entry(id) {
                     entry.insert(info);
@@ -1072,7 +1073,7 @@ impl ModelManager {
     }
 
     pub fn get_model_info(&self, model_id: &str) -> Option<ModelInfo> {
-        let models = self.available_models.lock().unwrap();
+        let models = self.available_models.lock_or_recover();
         models.get(model_id).cloned()
     }
 
@@ -1098,7 +1099,7 @@ impl ModelManager {
         supported_languages: Vec<String>,
     ) {
         let supported_languages = canonicalize_supported_languages(supported_languages);
-        let mut models = self.available_models.lock().unwrap();
+        let mut models = self.available_models.lock_or_recover();
         if let Some(model) = models.get_mut(model_id) {
             model.supports_streaming = supports_streaming;
             model.supports_translation = supports_translation;
@@ -1188,9 +1189,13 @@ impl ModelManager {
     fn update_download_status(&self) -> Result<()> {
         // Snapshot in-flight download ids before taking the registry lock (the
         // two locks are never nested) so a mid-download entry is never dropped.
-        let downloading_ids: HashSet<String> =
-            self.cancel_flags.lock().unwrap().keys().cloned().collect();
-        let mut models = self.available_models.lock().unwrap();
+        let downloading_ids: HashSet<String> = self
+            .cancel_flags
+            .lock_or_recover()
+            .keys()
+            .cloned()
+            .collect();
+        let mut models = self.available_models.lock_or_recover();
         let mut vanished_models: Vec<String> = Vec::new();
 
         for model in models.values_mut() {
@@ -1327,7 +1332,7 @@ impl ModelManager {
         // checking only whether the id exists is not sufficient.
         if !settings.selected_model.is_empty() {
             let is_available = {
-                let models = self.available_models.lock().unwrap();
+                let models = self.available_models.lock_or_recover();
                 Self::selected_model_is_available(&models, &settings.selected_model)
             };
 
@@ -1703,7 +1708,7 @@ impl ModelManager {
 
         // Mark downloading; the guard resets the flag on any error path.
         {
-            let mut models = self.available_models.lock().unwrap();
+            let mut models = self.available_models.lock_or_recover();
             if let Some(model) = models.get_mut(&model_id) {
                 model.is_downloading = true;
             }
@@ -1713,7 +1718,7 @@ impl ModelManager {
         // transfer promptly. The guard removes it on every exit path.
         let cancel_token = CancellationToken::new();
         {
-            let mut flags = self.cancel_flags.lock().unwrap();
+            let mut flags = self.cancel_flags.lock_or_recover();
             flags.insert(model_id.clone(), cancel_token.clone());
         }
 
@@ -1935,7 +1940,7 @@ impl ModelManager {
 
         cleanup.disarmed = true;
         self.update_download_status()?;
-        self.cancel_flags.lock().unwrap().remove(&model_id);
+        self.cancel_flags.lock_or_recover().remove(&model_id);
         let _ = self.app_handle.emit("model-download-complete", &model_id);
         info!("HF model {} downloaded", model_id);
         Ok(())
@@ -1984,7 +1989,7 @@ impl ModelManager {
 
     pub async fn download_model(&self, model_id: &str) -> Result<()> {
         let model_info = {
-            let models = self.available_models.lock().unwrap();
+            let models = self.available_models.lock_or_recover();
             models.get(model_id).cloned()
         };
 
@@ -2019,7 +2024,7 @@ impl ModelManager {
 
         // Mark as downloading
         {
-            let mut models = self.available_models.lock().unwrap();
+            let mut models = self.available_models.lock_or_recover();
             if let Some(model) = models.get_mut(model_id) {
                 model.is_downloading = true;
             }
@@ -2028,7 +2033,7 @@ impl ModelManager {
         // Create cancellation token for this download
         let cancel_token = CancellationToken::new();
         {
-            let mut flags = self.cancel_flags.lock().unwrap();
+            let mut flags = self.cancel_flags.lock_or_recover();
             flags.insert(model_id.to_string(), cancel_token.clone());
         }
 
@@ -2069,14 +2074,14 @@ impl ModelManager {
         // additionally sets is_downloaded = true.
         cleanup.disarmed = true;
         {
-            let mut models = self.available_models.lock().unwrap();
+            let mut models = self.available_models.lock_or_recover();
             if let Some(model) = models.get_mut(model_id) {
                 model.is_downloading = false;
                 model.is_downloaded = true;
                 model.partial_size = 0;
             }
         }
-        self.cancel_flags.lock().unwrap().remove(model_id);
+        self.cancel_flags.lock_or_recover().remove(model_id);
 
         // Emit completion event
         let _ = self.app_handle.emit("model-download-complete", model_id);
@@ -2093,7 +2098,7 @@ impl ModelManager {
         debug!("ModelManager: delete_model called for: {}", model_id);
 
         let model_info = {
-            let models = self.available_models.lock().unwrap();
+            let models = self.available_models.lock_or_recover();
             models.get(model_id).cloned()
         };
 
@@ -2136,7 +2141,7 @@ impl ModelManager {
             }
             // Alternate quants exist only while their files are on disk.
             if Self::is_catalog_alternate_quant(repo_id, &model_info.filename) {
-                self.available_models.lock().unwrap().remove(model_id);
+                self.available_models.lock_or_recover().remove(model_id);
             }
             self.update_download_status()?;
             let _ = self.app_handle.emit("model-deleted", model_id);
@@ -2181,7 +2186,7 @@ impl ModelManager {
         // Custom models should be removed from the list entirely since they
         // have no download URL and can't be re-downloaded
         if model_info.is_custom {
-            let mut models = self.available_models.lock().unwrap();
+            let mut models = self.available_models.lock_or_recover();
             models.remove(model_id);
             debug!("ModelManager: removed custom model from available models");
         } else {
@@ -2202,7 +2207,7 @@ impl ModelManager {
     /// unrelated in-flight download.
     fn mark_model_unavailable(&self, model_id: &str) {
         let removed = {
-            let mut models = self.available_models.lock().unwrap();
+            let mut models = self.available_models.lock_or_recover();
             let should_remove = models
                 .get(model_id)
                 .is_some_and(Self::disappears_when_missing);
@@ -2295,7 +2300,7 @@ impl ModelManager {
         // aborts its in-flight chunk tasks and unwinds promptly; the URL path
         // observes it on the next chunk of its stream loop.
         {
-            let flags = self.cancel_flags.lock().unwrap();
+            let flags = self.cancel_flags.lock_or_recover();
             if let Some(token) = flags.get(model_id) {
                 token.cancel();
                 info!("Cancellation token triggered for: {}", model_id);
@@ -2306,7 +2311,7 @@ impl ModelManager {
 
         // Update state immediately for UI responsiveness
         {
-            let mut models = self.available_models.lock().unwrap();
+            let mut models = self.available_models.lock_or_recover();
             if let Some(model) = models.get_mut(model_id) {
                 model.is_downloading = false;
             }
