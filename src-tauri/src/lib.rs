@@ -22,6 +22,7 @@ mod secure_input;
 mod settings;
 mod shortcut;
 mod signal_handle;
+mod sync_ext;
 mod transcription_coordinator;
 mod tray;
 mod tray_i18n;
@@ -242,9 +243,9 @@ fn initialize_core_logic(app_handle: &AppHandle) {
                 app_handle
                     .path()
                     .resolve(initial_icon_path, tauri::path::BaseDirectory::Resource)
-                    .unwrap(),
+                    .expect("tray icon is not in the bundled resources"),
             )
-            .unwrap(),
+            .expect("bundled tray icon could not be decoded"),
         )
         .tooltip(tray::tray_tooltip())
         .icon_as_template(true);
@@ -316,7 +317,7 @@ fn initialize_core_logic(app_handle: &AppHandle) {
                 app.exit(0);
             }
             id if id.starts_with("model_select:") => {
-                let model_id = id.strip_prefix("model_select:").unwrap().to_string();
+                let model_id = id["model_select:".len()..].to_string();
                 let current_model = settings::get_settings(app).selected_model;
                 if model_id == current_model {
                     return;
@@ -337,7 +338,7 @@ fn initialize_core_logic(app_handle: &AppHandle) {
             _ => {}
         })
         .build(app_handle)
-        .unwrap();
+        .expect("failed to create the tray icon");
     app_handle.manage(tray);
 
     // Initialize tray menu with idle state
